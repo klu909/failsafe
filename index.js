@@ -3,6 +3,10 @@ const Resque = require('node-resque');
 const { parseExpression } = require('cron-parser');
 const stringHash = require('string-hash');
 
+// should change following values
+const cronAnnotation = "screwdriver.cd/buildPeriodically";
+const periodicBuildConfigs = "periodicBuildConfigs";
+const periodicBuildQueue = 'periodicBuilds';
 const connectionDetails = {
     host: "127.0.0.1",
     options: {
@@ -11,6 +15,8 @@ const connectionDetails = {
     },
     port: 6379
 };
+// should change values above
+
 const resqueConnection = { ...connectionDetails, pkg: 'ioredis' };
 const redis = new Redis({
     port: connectionDetails.port,
@@ -20,10 +26,7 @@ const redis = new Redis({
 });
 const queue = new Resque.Queue({ connection: resqueConnection });
 
-const cronAnnotation = "screwdriver.cd/buildPeriodically";
-const periodicBuildConfigs = "periodicBuildConfigs";
-const periodicBuildQueue = 'periodicBuilds';
-
+// following functions taken from queue-service
 function evaluateHash(hash, min, max) {
     return (hash % (max + 1 - min)) + min;
 };
@@ -103,22 +106,29 @@ function nextExecution(cronExp) {
 
     return interval.next().getTime();
 };
+// functions above taken from queue-service
 
 async function main() {
     await queue.connect();
 
+    // using hscanstream to avoid possible blocking
     const stream = redis.hscanStream(periodicBuildConfigs);
 
     stream.on("data", (resultKeys) => {
         stream.pause();
 
+        // iterating through all keys under buildconfigs
         Promise.all(resultKeys.map((key) => {
+            // ignoring jobid keys
             if (isNaN(key)) {
                 const { job } = JSON.parse(key);
                 const cron = job.permutations[0].annotations[cronAnnotation];
                 const next = nextExecution(transformCron(cron, job.id));
                 console.log(`processing job ${job.id}`);
 
+                // attempting to insert everysingle job config 
+                // missing periodic build will be added
+                // adding an existing build will thrown 'Job already enqueued at this time with same arguments' error
                 queue.enqueueAt(next, periodicBuildQueue, 'startDelayed', [{ jobId: job.id }])
                     .then(() => {
                         console.log(`reenqueued job ${job.id} into periodicBuildQueue`);
@@ -132,8 +142,9 @@ async function main() {
         });
     });
 
+    // operations are not actually done on stream ends, some jobs are still processing before we can end
     stream.on("end", () => {
-        console.log('done with failsafe');
+        console.log('hscan stream ends');
     });
 }
 
